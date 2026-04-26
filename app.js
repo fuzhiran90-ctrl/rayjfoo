@@ -720,7 +720,6 @@ function importCSV() {
   const text = document.getElementById('csv-text').value.trim();
   if (!text) { showToast('请先选择文件或粘贴内容'); return; }
 
-  // 检测来源
   let source = csvSource;
   if (source === 'auto') {
     const lower = text.toLowerCase();
@@ -729,77 +728,107 @@ function importCSV() {
     else source = 'alipay';
   }
 
-  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  const rawLines = text.split(/\r?\n/);
+  const lines = rawLines.map(l => l.trim());
   if (lines.length < 2) { showToast('文件内容太少'); return; }
 
-  let imported = 0, skipped = 0, errors = [];
+  // 检测分隔符: Tab还是逗号
+  let tabCnt = 0, comCnt = 0;
+  for (let i = 0; i < Math.min(lines.length, 15); i++) {
+    tabCnt += (lines[i].match(/\t/g) || []).length;
+    comCnt += (lines[i].match(/,/g) || []).length;
+  }
+  const delimiter = tabCnt > comCnt ? '\t' : ',';
+  const splitLine = delimiter === '\t' ? l => l.split('\t') : parseCSVLine;
 
-  // 逐行分析：不依赖标题行，每行尝试智能识别
+  // 找到真正标题行（包含 "交易时间" 和 "金额" 的行）
+  let headerIdx = -1;
   for (let i = 0; i < lines.length; i++) {
+    const cols = splitLine(lines[i]);
+    const hasDate = cols.some(c => /交易时间/.test(c));
+    const hasAmount = cols.some(c => /金额/.test(c));
+    if (hasDate && hasAmount) { headerIdx = i; break; }
+  }
+
+  if (headerIdx === -1) {
+    for (let i = 0; i < lines.length; i++) {
+      const cols = splitLine(lines[i]);
+      if (cols.some(c => /交易/.test(c)) && cols.some(c => /金额/.test(c))) { headerIdx = i; break; }
+      if (cols.some(c => /时间/.test(c)) && cols.some(c => /金额/.test(c))) { headerIdx = i; break; }
+    }
+  }
+
+  if (headerIdx === -1) {
+    showToast('未找到数据标题行');
+    document.getElementById('csv-result').className = 'csv-result error';
+    document.getElementById('csv-result').innerHTML = '❌ 未找到含"交易时间"和"金额"的标题行'+
+      '<span class="detail">前5行:<br>'+lines.slice(0,5).map((l,i)=>'行'+(i+1)+': '+escapeHTML(l.slice(0,60))).join('<br>')+'</span>';
+    return;
+  }
+
+  const headerCols = splitLine(lines[headerIdx]);
+  const col = { date:-1, amount:-1, type:-1, note:-1, status:-1 };
+
+  for (let i = 0; i < headerCols.length; i++) {
+    const c = headerCols[i].trim();
+    if (/交易时间/.test(c)) col.date = i;
+    else if (/金额/.test(c)) col.amount = i;
+    else if (/收.?支/.test(c)) col.type = i;
+    else if (/商品|说明|名称/.test(c) && col.note === -1) col.note = i;
+    else if (/状态/.test(c)) col.status = i;
+    else if (/对方/.test(c) && col.note === -1) col.note = i;
+  }
+
+  // 列映射保底
+  if (col.date === -1 || col.amount === -1) {
+    if (source === 'alipay') { col.date=0; col.note=4; col.type=5; col.amount=6; col.status=8; }
+    else { col.date=0; col.note=2; col.type=3; col.amount=4; col.status=6; }
+  }
+
+  let imported = 0, skipped = 0, errors = [];
+  const maxIdx = Math.max(col.date, col.amount, col.type, col.status, col.note);
+
+  for (let i = headerIdx + 1; i < lines.length; i++) {
     try {
-      const cols = parseCSVLine(lines[i]);
-      if (cols.length < 4) { skipped++; continue; }
+      const row = lines[i];
+      if (!row) { skipped++; continue; }
 
-      // 步骤1：找日期
-      let foundDate = null, dateStr = '';
-      for (const val of cols) {
-        const d = parseDate(val.trim());
-        if (d) { foundDate = d; dateStr = val.trim(); break; }
-      }
-      if (!foundDate) { skipped++; continue; }
-      if (foundDate > new Date()) { skipped++; continue; }
-
-      // 步骤2：找金额
-      let amount = 0;
-      for (const val of cols) {
-        const num = parseFloat(val.trim().replace(/[¥￥,]/g, ''));
-        if (!isNaN(num) && num > 0 && num > amount) amount = num;
-      }
-      if (amount <= 0) { skipped++; continue; }
-
-      // 步骤3：判断收支
-      const rowJoined = cols.join(',');
-      const hasExpense = /支出/.test(rowJoined);
-      const hasIncome = /收入/.test(rowJoined);
-      let isExpense = true;
-      if (hasIncome && !hasExpense) isExpense = false;
-      else if (hasExpense && !hasIncome) isExpense = true;
-      else isExpense = /支出/.test(cols[getTypeCol(cols)] || '');
-      // 如果还是不确定，查看金额前面的列
-      if (!hasExpense && !hasIncome) {
-        // 查找包含"收"或"支"的列
-        for (const val of cols) {
-          if (val.includes('支出') || val.includes('消费')) { isExpense = true; break; }
-          if (val.includes('收入') || val.includes('退款') || val.includes('红包收入')) { isExpense = false; break; }
-        }
+      // 跳过分隔线、统计行、提示行
+      if (/^-+$/.test(row) || /笔$/.test(row) || /：/.test(row) ||
+          /提示/.test(row) || /回单/.test(row)) {
+        skipped++; continue;
       }
 
-      // 步骤4：找备注（非日期、非金额、非收支的文本列，优先商品说明类）
-      let note = '';
-      for (const val of cols) {
-        const v = val.trim();
-        if (v && !parseDate(v) && isNaN(parseFloat(v.replace(/[¥￥,]/g,''))) && v.length > 1 && v.length < 50
-            && !v.includes('交易') && !v.includes('支付宝') && !v.includes('姓名') && !v.includes('账户')
-            && !v.includes('订单') && !v.includes('商户') && !v.includes('状态')) {
-          note = v;
-          break;
-        }
-      }
+      const cols = splitLine(row);
+      if (cols.length <= maxIdx) { skipped++; continue; }
 
-      // 步骤5：去重
-      const dateISO = foundDate.getFullYear()+'-'+String(foundDate.getMonth()+1).padStart(2,'0')+'-'+String(foundDate.getDate()).padStart(2,'0');
-      amount = Math.round(amount * 100) / 100;
+      const dateRaw = (cols[col.date] || '').trim();
+      const amountRaw = (cols[col.amount] || '').trim().replace(/[¥￥,]/g, '');
+      const typeRaw = (col.type !== -1 ? (cols[col.type] || '').trim() : '');
+      const desc = (col.note !== -1 ? (cols[col.note] || '').trim() : '');
+
+      if (!amountRaw || isNaN(parseFloat(amountRaw))) { skipped++; continue; }
+
+      const dt = parseDate(dateRaw);
+      if (!dt) { errors.push('行'+(i+1)+': 日期无效'); continue; }
+      if (dt > new Date()) { skipped++; continue; }
+
+      const dateISO = dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
+      const amount = Math.round(Math.abs(parseFloat(amountRaw)) * 100) / 100;
+      if (isNaN(amount) || amount <= 0) { skipped++; continue; }
+
+      const isExpense = typeRaw === '支出';
 
       if (state.expenses.some(x => x.date === dateISO && Math.abs(x.amount-amount)<0.01)) {
         skipped++; continue;
       }
 
-      const cat = mapCategory(note, isExpense);
+      const cat = mapCategory(desc || dateRaw, isExpense);
       state.expenses.push({
         id: DB.genId(),
         amount,
         category: cat,
-        note: note.slice(0,30),
+        note: (desc || '').slice(0,30),
         date: dateISO,
         isExpense,
         createdAt: new Date().toISOString(),
@@ -822,23 +851,15 @@ function importCSV() {
     renderDashboard();
     renderExpenses();
   } else {
-    const preview = lines.slice(0, Math.min(5, lines.length)).map((l,i) => '行'+(i+1)+': '+escapeHTML(l.slice(0,60))).join('<br>');
-    let diag = '<span class="detail">来源: '+source+'</span>';
-    diag += '<span class="detail">文件共 '+lines.length+' 行，跳过 '+skipped+' 行</span>';
-    if (errors.length) diag += '<span class="detail">错误:<br>'+errors.slice(0,5).join('<br>')+'</span>';
-    diag += '<span class="detail">前5行预览:<br>'+preview+'</span>';
-    diag += '<span class="detail">💡 提示: 检查编码(切GBK)和文件格式是否正确</span>';
+    let diag = '<span class="detail">来源: '+source+' | 分隔符: '+(delimiter=='\t'?'Tab':',')+'</span>';
+    diag += '<span class="detail">标题行: 第'+(headerIdx+1)+'行 → '+escapeHTML(headerCols.slice(0,6).join(' | '))+'</span>';
+    diag += '<span class="detail">列映射: 日期='+col.date+' 金额='+col.amount+' 收支='+col.type+' 备注='+col.note+' 状态='+col.status+'</span>';
+    diag += '<span class="detail">文件共 '+lines.length+' 行</span>';
+    if (errors.length) diag += '<span class="detail">错误:<br>'+errors.slice(0,3).join('<br>')+'</span>';
 
     resultEl.className = 'csv-result error';
     resultEl.innerHTML = '❌ 未能导入任何记录'+diag;
   }
-}
-
-function getTypeCol(cols) {
-  for (let i = 0; i < cols.length; i++) {
-    if (/收.?支/.test(cols[i]) || cols[i] === '支出' || cols[i] === '收入') return i;
-  }
-  return Math.min(3, cols.length - 1);
 }
 
 function escapeHTML(s) {
