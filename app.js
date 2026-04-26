@@ -837,12 +837,29 @@ function importCSV() {
     renderDashboard();
     renderExpenses();
   } else {
-    let msg = '❌ 未能导入任何记录';
-    if (errors.length) msg += '<span class="detail">'+errors.slice(0,5).join('<br>')+'</span>';
-    else msg += '<span class="detail">检查: ①是否选对了来源(支付宝/微信) ②内容是否乱码(切换编码) ③CSV格式是否正确</span>';
+    // 诊断信息
+    let diag = '';
+    diag += '<span class="detail">来源: '+source+'</span>';
+    diag += '<span class="detail">标题行: 第'+(headerIdx+1)+'行 → '+escapeHTML(headerCols.slice(0,6).join(' | '))+'</span>';
+    diag += '<span class="detail">列映射: 日期='+col.date+' 金额='+col.amount+' 类型='+col.type+' 备注='+col.note+' 状态='+col.status+'</span>';
+    // 显示前3条数据行
+    const dataPreview = [];
+    for (let i = headerIdx+1; i < Math.min(headerIdx+4, lines.length); i++) {
+      dataPreview.push('行'+(i+1)+': '+escapeHTML(lines[i].slice(0,80)));
+    }
+    diag += '<span class="detail">前几条数据:<br>'+dataPreview.join('<br>')+'</span>';
+    if (errors.length) diag += '<span class="detail">错误:<br>'+errors.slice(0,5).join('<br>')+'</span>';
+    if (skipped > 0) diag += '<span class="detail">共跳过 '+skipped+' 行</span>';
+
     resultEl.className = 'csv-result error';
-    resultEl.innerHTML = msg;
+    resultEl.innerHTML = '❌ 未能导入任何记录'+diag;
   }
+}
+
+function escapeHTML(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
 }
 
 function parseDate(str) {
