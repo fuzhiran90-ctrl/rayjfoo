@@ -649,17 +649,65 @@ function renderStats() {
 }
 
 // ==================== CSV导入 ====================
-let csvSource = 'alipay';
+let csvSource = 'auto';
+let csvEncoding = 'utf8';
 
 function openCSVImport() {
-  csvSource = 'alipay';
+  csvSource = 'auto';
+  csvEncoding = 'utf8';
   document.getElementById('csv-text').value = '';
   document.getElementById('csv-result').innerHTML = '';
   document.getElementById('csv-result').className = 'csv-result';
+  document.getElementById('csv-file').value = '';
+  document.getElementById('csv-file-name').textContent = '未选择文件';
+
   document.querySelectorAll('#csv-source-toggle .toggle-btn').forEach((b,i) => {
     b.classList.toggle('active', i===0);
   });
+  document.querySelectorAll('#csv-encoding-toggle .toggle-btn').forEach((b,i) => {
+    b.classList.toggle('active', i===0);
+  });
+
   document.getElementById('modal-csv').classList.add('open');
+}
+
+// 选择文件
+document.getElementById('csv-file').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  document.getElementById('csv-file-name').textContent = file.name;
+  readCSVFile(file, csvEncoding);
+});
+
+function selectEncoding(el, enc) {
+  csvEncoding = enc;
+  document.querySelectorAll('#csv-encoding-toggle .toggle-btn').forEach(b => b.classList.remove('active'));
+  el.classList.add('active');
+  const fileInput = document.getElementById('csv-file');
+  if (fileInput.files && fileInput.files[0]) {
+    readCSVFile(fileInput.files[0], enc);
+  }
+}
+
+function readCSVFile(file, encoding) {
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    if (encoding === 'gbk') {
+      try {
+        const decoder = new TextDecoder('gbk');
+        document.getElementById('csv-text').value = decoder.decode(e.target.result);
+      } catch {
+        const decoder = new TextDecoder('utf-8');
+        document.getElementById('csv-text').value = decoder.decode(e.target.result);
+        showToast('GBK 解码失败，已回退到 UTF-8');
+      }
+    } else {
+      const decoder = new TextDecoder('utf-8');
+      document.getElementById('csv-text').value = decoder.decode(e.target.result);
+    }
+  };
+  reader.onerror = function() { showToast('读取文件失败'); };
+  reader.readAsArrayBuffer(file);
 }
 
 function selectCSVSource(el, src) {
@@ -670,70 +718,110 @@ function selectCSVSource(el, src) {
 
 function importCSV() {
   const text = document.getElementById('csv-text').value.trim();
-  if (!text) { showToast('请粘贴 CSV 内容'); return; }
+  if (!text) { showToast('请先选择文件或粘贴内容'); return; }
 
-  const lines = text.split('\n').filter(l => l.trim());
-  let imported = 0, skipped = 0, errors = [];
+  // 自动检测来源
+  let source = csvSource;
+  if (source === 'auto') {
+    const lower = text.toLowerCase();
+    if (lower.includes('支付宝') || lower.includes('余额')) source = 'alipay';
+    else if (lower.includes('微信支付') || lower.includes('微信') || lower.includes('商户单号')) source = 'wechat';
+    else source = 'alipay';
+  }
 
-  for (let i = 1; i < lines.length; i++) {
-    try {
+  const lines = text.split(/\r?\n/).filter(l => l.trim());
+  if (lines.length < 2) { showToast('文件内容太少，需要标题行+数据行'); return; }
+
+  // 寻找标题行
+  let headerIdx = -1;
+  for (let i = 0; i < Math.min(lines.length, 10); i++) {
+    const row = lines[i];
+    if (/时间/.test(row) && /金额/.test(row)) { headerIdx = i; break; }
+    if (/交易/.test(row) && /金额/.test(row)) { headerIdx = i; break; }
+  }
+  if (headerIdx === -1) {
+    // 没有找到标题行，尝试找第一行有数字的
+    for (let i = 0; i < Math.min(lines.length, 5); i++) {
       const cols = parseCSVLine(lines[i]);
-      if (cols.length < 7) { skipped++; continue; }
+      if (cols.length >= 6) { headerIdx = i; break; }
+    }
+    if (headerIdx === -1) headerIdx = 0;
+  }
 
-      let dateStr, description, type, amountStr, status;
+  // 解析标题行，映射列位置
+  const headerCols = parseCSVLine(lines[headerIdx]);
+  const col = { date:-1, amount:-1, type:-1, note:-1, status:-1 };
 
-      if (csvSource === 'alipay') {
-        dateStr = cols[0].trim();
-        description = (cols[3]||'').trim();
-        type = (cols[4]||'').trim();
-        amountStr = (cols[5]||'').trim().replace(/,/g, '');
-        status = (cols[7]||'').trim();
-        if (status !== '交易成功' && status !== '收支') { skipped++; continue; }
-      } else {
-        dateStr = cols[0].trim();
-        description = (cols[3]||'').trim();
-        type = (cols[4]||'').trim();
-        amountStr = (cols[5]||'').trim().replace(/,/g, '');
-        status = (cols[7]||'').trim();
-        if (status !== '支付成功' && status !== '已全额退款') { skipped++; continue; }
-      }
+  for (let i = 0; i < headerCols.length; i++) {
+    const c = headerCols[i].trim();
+    if (/时间|日期/.test(c) && col.date === -1) col.date = i;
+    if (/金额/.test(c) && col.amount === -1) col.amount = i;
+    if (/收.?支/.test(c)) col.type = i;
+    else if (/收$|^收/.test(c)) col.type = i;
+    else if (/支$|^支/.test(c)) col.type = i;
+    if (/商品|说明|名称/.test(c) && col.note === -1) col.note = i;
+    if (/状态/.test(c) && col.status === -1) col.status = i;
+    if (/分类/.test(c) && col.note === -1) col.note = i;
+    if (/对方/.test(c) && col.note === -1) col.note = i;
+  }
 
-      // Parse date
-      dateStr = dateStr.replace(/-/g, '/'); // normalize
-      // Handle various formats
-      let dt = new Date(dateStr);
-      if (isNaN(dt.getTime())) {
-        // Try yyyy/mm/dd HH:mm:ss
-        const m = dateStr.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
-        if (m) dt = new Date(parseInt(m[1]), parseInt(m[2])-1, parseInt(m[3]));
-      }
-      if (isNaN(dt.getTime())) { errors.push('第'+(i+1)+'行: 日期无效'); continue; }
+  // 如果列映射失败，按来源使用固定位置
+  if (col.date === -1 || col.amount === -1) {
+    if (source === 'alipay') { col.date=0; col.note=3; col.type=4; col.amount=5; col.status=7; }
+    else { col.date=0; col.note=3; col.type=4; col.amount=5; col.status=7; }
+  }
+
+  let imported = 0, skipped = 0, errors = [];
+  const maxIdx = Math.max(col.date, col.amount, col.type, col.status, col.note);
+
+  for (let i = headerIdx + 1; i < lines.length; i++) {
+    try {
+      if (i >= lines.length) continue;
+      const cols = parseCSVLine(lines[i]);
+      if (cols.length <= maxIdx) { skipped++; continue; }
+
+      const dateRaw = (cols[col.date] || '').trim();
+      const desc = (col.note !== -1 ? (cols[col.note] || '') : '').trim();
+      const typeRaw = (col.type !== -1 ? (cols[col.type] || '') : '').trim();
+      let amountRaw = (cols[col.amount] || '').trim().replace(/,/g, '');
+
+      // 跳过非数据行
+      if (isNaN(parseFloat(amountRaw.replace(/[¥￥]/g,'')))) { skipped++; continue; }
+
+      const statusRaw = col.status !== -1 ? (cols[col.status] || '').trim() : '';
+
+      // 状态过滤 (支付宝/微信状态值不同)
+      if (statusRaw && !/成功|收支|已全额/.test(statusRaw)) { skipped++; continue; }
+
+      // 解析日期
+      const dt = parseDate(dateRaw);
+      if (!dt) { errors.push('行'+(i+1)+': 日期无效 "'+dateRaw.slice(0,16)+'"'); continue; }
       if (dt > new Date()) { skipped++; continue; }
 
       const dateISO = dt.getFullYear()+'-'+String(dt.getMonth()+1).padStart(2,'0')+'-'+String(dt.getDate()).padStart(2,'0');
-      const amount = parseFloat(amountStr);
+      const amount = Math.abs(parseFloat(amountRaw.replace(/[¥￥]/g,'')));
       if (isNaN(amount) || amount <= 0) { skipped++; continue; }
-      const isExpense = (type === '支出' || type === '');
-      const isExpenseBool = csvSource === 'alipay' ? isExpense : (type === '支出');
 
-      // Dedup
+      const isExpense = typeRaw === '支出';
+
+      // 去重
       if (state.expenses.some(x => x.date === dateISO && Math.abs(x.amount-amount)<0.01)) {
         skipped++; continue;
       }
 
-      const cat = mapCategory(description, isExpenseBool);
+      const cat = mapCategory(desc, isExpense);
       state.expenses.push({
         id: DB.genId(),
-        amount,
+        amount: Math.round(amount * 100) / 100,
         category: cat,
-        note: description.slice(0,30),
+        note: desc.slice(0,30),
         date: dateISO,
-        isExpense: isExpenseBool,
+        isExpense,
         createdAt: new Date().toISOString(),
       });
       imported++;
     } catch(e) {
-      errors.push('第'+(i+1)+'行: 解析错误');
+      errors.push('行'+(i+1)+': 解析错误');
     }
   }
 
@@ -742,16 +830,31 @@ function importCSV() {
   const resultEl = document.getElementById('csv-result');
   if (imported > 0) {
     resultEl.className = 'csv-result success';
-    resultEl.innerHTML = '✅ 成功导入 '+imported+' 条记录' + (skipped>0 ? '，跳过 '+skipped+' 条' : '');
+    let msg = '✅ 成功导入 '+imported+' 条记录';
+    if (skipped > 0) msg += '，跳过 '+skipped+' 条';
+    if (errors.length) msg += '<span class="detail">⚠️ '+errors.length+' 个警告（最多显示5条）:<br>'+errors.slice(0,5).join('<br>')+'</span>';
+    resultEl.innerHTML = msg;
     renderDashboard();
     renderExpenses();
   } else {
+    let msg = '❌ 未能导入任何记录';
+    if (errors.length) msg += '<span class="detail">'+errors.slice(0,5).join('<br>')+'</span>';
+    else msg += '<span class="detail">检查: ①是否选对了来源(支付宝/微信) ②内容是否乱码(切换编码) ③CSV格式是否正确</span>';
     resultEl.className = 'csv-result error';
-    resultEl.innerHTML = '❌ 未能导入任何记录。请检查格式是否正确。';
+    resultEl.innerHTML = msg;
   }
-  if (errors.length) {
-    resultEl.innerHTML += '<br><span style="font-size:12px">'+errors.slice(0,3).join('<br>')+'</span>';
+}
+
+function parseDate(str) {
+  let s = str.trim();
+  const m = s.match(/(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (m) {
+    const d = new Date(parseInt(m[1]), parseInt(m[2])-1, parseInt(m[3]));
+    if (!isNaN(d.getTime())) return d;
   }
+  const d2 = new Date(s.replace(/-/g, '/'));
+  if (!isNaN(d2.getTime())) return d2;
+  return null;
 }
 
 function parseCSVLine(line) {
